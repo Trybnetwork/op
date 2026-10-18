@@ -578,7 +578,7 @@
                 <button type="button" class="link-btn" id="history-link">Transaction History&nbsp;&nbsp;›</button>
               </div>
               <div class="bal-row">
-                <span><span class="bal-amount" id="bal-amount">₦8.61</span><span class="bal-chev" aria-hidden="true">›</span></span>
+                <span><span class="bal-amount" id="bal-amount">₦0.00</span><span class="bal-chev" aria-hidden="true">›</span></span>
                 <button type="button" class="btn-add" id="add-money-btn">+ Add Money</button>
               </div>
               <div class="add-panel" id="add-panel" hidden>
@@ -968,6 +968,7 @@
 
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
     <script>
       (function () {
         /* ================= Data ================= */
@@ -1005,23 +1006,22 @@
         var ARROW_OUT_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17 17 7M9 7h8v8"/></svg>';
         var ARROW_IN_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M17 7 7 17M15 17H7V9"/></svg>';
 
-        /* ================= State (in-memory, this session only) ================= */
+        /* ================= Supabase ================= */
+        var SUPABASE_URL = "https://zvubytosshkxpbpvgcsw.supabase.co";
+        var SUPABASE_ANON_KEY = "sb_publishable_c1sl1Mw4Y5EMWjkmYSzEow_m5Yowqk0";
+        var sb = (window.supabase && window.supabase.createClient)
+          ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+          : null;
+
+        /* ================= State ================= */
         var account = null;
-        var balance = 8.61;
+        var balance = 0;
         var balanceVisible = true;
         var transactions = [];
         var pendingTransfer = null;
         var currentRecord = null;
         var receiptReturn = "view-dashboard";
-
-        transactions.push({
-          id: "seed-1", kind: "interest", title: "Savings Interest Earned",
-          amount: 0.09, stamp: new Date(2026, 9, 18, 1, 14, 13)
-        });
-        transactions.push({
-          id: "seed-2", kind: "interest", title: "Savings Interest Earned",
-          amount: 0.09, stamp: new Date(2026, 9, 17, 2, 53, 56)
-        });
+        var transferBusy = false;
 
         /* ================= Helpers ================= */
         function $(id) { return document.getElementById(id); }
@@ -1071,6 +1071,135 @@
           var el = $(id);
           el.textContent = msg || "";
           el.classList.toggle("show", !!msg);
+        }
+
+        /* ================= Backend (Supabase) ================= */
+        function phoneToEmail(phoneDigits) { return phoneDigits + "@op.internal"; }
+        function normalizePhone(d) {
+          if (d.length === 11 && d.charAt(0) === "0") return "234" + d.slice(1);
+          if (d.length === 10) return "234" + d;
+          return d;
+        }
+        function errText(err, fallback) {
+          return (err && err.message) ? err.message : fallback;
+        }
+        function isRecipientNotFound(err) { return !!err && /recipient not found/i.test(err.message || ""); }
+        function isInsufficient(err) { return !!err && /insufficient/i.test(err.message || ""); }
+
+        async function loadProfile(user) {
+          var name = (user.user_metadata && user.user_metadata.full_name) || "";
+          var phone = (user.user_metadata && user.user_metadata.phone) || "";
+          var res = await sb.from("op_profiles").select("full_name, phone").eq("id", user.id).maybeSingle();
+          if (res.data) {
+            if (res.data.full_name) name = res.data.full_name;
+            if (res.data.phone) phone = res.data.phone;
+          }
+          account = { id: user.id, name: name, phone: phone };
+        }
+
+        async function loadWallet() {
+          if (!account || !sb) return;
+          var res = await sb.from("op_wallets").select("balance").eq("user_id", account.id).maybeSingle();
+          balance = res.data ? (Number(res.data.balance) || 0) : 0;
+          renderBalance();
+        }
+
+        async function writeWallet(newBal) {
+          var upd = await sb.from("op_wallets").update({ balance: newBal }).eq("user_id", account.id).select("user_id");
+          if (!upd.error && upd.data && upd.data.length) return true;
+          var ins = await sb.from("op_wallets").insert({ user_id: account.id, balance: newBal });
+          return !ins.error;
+        }
+
+        function mapTx(row) {
+          var stamp = row.created_at ? new Date(row.created_at) : new Date();
+          if (row.direction === "received") {
+            return {
+              id: row.id, kind: "received",
+              sender: row.counterparty_name || "Transfer",
+              bank: row.counterparty_bank || "",
+              masked: row.counterparty_masked || "",
+              remark: row.remark || "",
+              amount: Number(row.amount) || 0,
+              stamp: stamp,
+              txNo: row.transaction_no || "",
+              session: row.session_id || ""
+            };
+          }
+          return {
+            id: row.id, kind: "sent",
+            name: row.counterparty_name || "Recipient",
+            bank: row.counterparty_bank || null,
+            acct: row.counterparty_account || null,
+            phone: row.counterparty_phone || null,
+            amount: Number(row.amount) || 0,
+            stamp: stamp,
+            txNo: row.transaction_no || "",
+            session: row.session_id || ""
+          };
+        }
+
+        async function loadTransactions() {
+          if (!account || !sb) return;
+          var res = await sb.from("op_transactions").select("*").eq("user_id", account.id).order("created_at", { ascending: false });
+          transactions = (!res.error && res.data) ? res.data.map(mapTx) : [];
+          renderHistory();
+        }
+
+        async function refreshAccountData() {
+          await loadWallet();
+          await loadTransactions();
+        }
+
+        async function insertTx(full, minimal) {
+          var r = await sb.from("op_transactions").insert(full);
+          if (!r.error) return true;
+          if (minimal) {
+            var r2 = await sb.from("op_transactions").insert(minimal);
+            return !r2.error;
+          }
+          return false;
+        }
+
+        function rpcIds(data) {
+          var r = Array.isArray(data) ? data[0] : data;
+          if (r && typeof r === "object") {
+            return {
+              session: r.session_id || "",
+              txNo: r.transaction_no || "",
+              name: r.recipient_name || r.counterparty_name || r.full_name || ""
+            };
+          }
+          return { session: "", txNo: "", name: "" };
+        }
+
+        /* External bank transfer fallback: deduct locally + record a 'sent' row. */
+        async function externalTransfer(p) {
+          await loadWallet();
+          if (p.amount > balance) {
+            showToast("Insufficient balance for this transfer.");
+            showView(p.fromView);
+            return null;
+          }
+          var okBal = await writeWallet(balance - p.amount);
+          if (!okBal) {
+            showToast("Transfer failed. Please try again.");
+            showView(p.fromView);
+            return null;
+          }
+          var ids = { session: genDigits(30), txNo: genDigits(24), name: "" };
+          var minimal = {
+            user_id: account.id, direction: "sent", amount: p.amount,
+            counterparty_name: p.name, session_id: ids.session, transaction_no: ids.txNo
+          };
+          var full = {
+            user_id: account.id, direction: "sent", amount: p.amount,
+            counterparty_name: p.name, session_id: ids.session, transaction_no: ids.txNo
+          };
+          if (p.kind === "sent-bank") { full.counterparty_bank = p.bank; full.counterparty_account = p.acct; }
+          else { full.counterparty_phone = p.phone; }
+          await insertTx(full, minimal);
+          return ids;
         }
 
         /* ================= Dropdowns ================= */
@@ -1126,16 +1255,14 @@
 
         /* ================= History rendering ================= */
         function txTitle(rec) {
-          if (rec.kind === "interest") return rec.title;
           if (rec.kind === "received") return "Transfer from " + rec.sender;
           return "Transfer to " + rec.name;
         }
         function buildTxItem(rec) {
           var li = document.createElement("li");
-          li.className = "tx-item" + (rec.kind === "interest" ? "" : " clickable");
+          li.className = "tx-item clickable";
           var ic = document.createElement("span");
-          if (rec.kind === "interest") { ic.className = "tx-ic purple"; ic.innerHTML = PCT_ICON; }
-          else if (rec.kind === "received") { ic.className = "tx-ic green"; ic.innerHTML = ARROW_IN_ICON; }
+          if (rec.kind === "received") { ic.className = "tx-ic green"; ic.innerHTML = ARROW_IN_ICON; }
           else { ic.className = "tx-ic green"; ic.innerHTML = ARROW_OUT_ICON; }
           var main = document.createElement("div");
           main.className = "tx-main";
@@ -1149,22 +1276,20 @@
           var right = document.createElement("div");
           right.className = "tx-right";
           var amt = document.createElement("div");
-          amt.className = "tx-amt" + (rec.amount >= 0 && rec.kind !== "sent-bank" && rec.kind !== "sent-op" ? " credit" : "");
-          var isDebit = rec.kind === "sent-bank" || rec.kind === "sent-op";
+          var isDebit = rec.kind !== "received";
+          amt.className = "tx-amt" + (!isDebit ? " credit" : "");
           amt.textContent = (isDebit ? "−" : "+") + fmtNaira(rec.amount);
           var status = document.createElement("span");
           status.className = "tx-status";
           status.textContent = "Successful";
           right.appendChild(amt); right.appendChild(status);
           li.appendChild(ic); li.appendChild(main); li.appendChild(right);
-          if (rec.kind !== "interest") {
-            li.setAttribute("role", "button");
-            li.setAttribute("tabindex", "0");
-            li.addEventListener("click", function () { openReceipt(rec, "view-history"); });
-            li.addEventListener("keydown", function (e) {
-              if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openReceipt(rec, "view-history"); }
-            });
-          }
+          li.setAttribute("role", "button");
+          li.setAttribute("tabindex", "0");
+          li.addEventListener("click", function () { openReceipt(rec, "view-history"); });
+          li.addEventListener("keydown", function (e) {
+            if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openReceipt(rec, "view-history"); }
+          });
           return li;
         }
         function renderHistory() {
@@ -1172,21 +1297,20 @@
           recent.innerHTML = "";
           transactions.slice(0, 2).forEach(function (rec) {
             var item = buildTxItem(rec);
-            if (rec.kind !== "interest") {
-              item.addEventListener("click", function () { openReceipt(rec, "view-dashboard"); });
-            }
+            item.addEventListener("click", function () { openReceipt(rec, "view-dashboard"); });
             recent.appendChild(item);
           });
+          if (!transactions.length) {
+            var emptyLi = document.createElement("li");
+            emptyLi.className = "tx-empty";
+            emptyLi.textContent = "No transactions yet.";
+            recent.appendChild(emptyLi);
+          }
           var hist = $("history-list");
           hist.innerHTML = "";
           transactions.forEach(function (rec) { hist.appendChild(buildTxItem(rec)); });
           $("history-empty").hidden = transactions.length > 0;
         }
-        function addTransaction(rec) {
-          transactions.unshift(rec);
-          renderHistory();
-        }
-
         /* ================= Dashboard ================= */
         function openDashboard() {
           var name = (account.name || "").trim();
@@ -1194,7 +1318,7 @@
           $("dash-avatar").textContent = initials;
           $("dash-name").textContent = name || "there";
           $("me-name").textContent = name || "—";
-          $("me-phone").textContent = account.phone;
+          $("me-phone").textContent = account.phone ? "+" + digitsOnly(account.phone) : "—";
           renderBalance();
           renderHistory();
           showView("view-dashboard");
@@ -1279,7 +1403,7 @@
         /* ================= Auth ================= */
         function validPhone(v) { return digitsOnly(v).length >= 7; }
 
-        $("signup-form").addEventListener("submit", function (e) {
+        $("signup-form").addEventListener("submit", async function (e) {
           e.preventDefault();
           var name = $("su-name").value.trim();
           var code = $("su-code").value;
@@ -1293,13 +1417,40 @@
           setFieldError("su-phone-error", !okPhone);
           setFieldError("su-password-error", !okPass);
           if (!okName || !okPhone || !okPass) { setFormError("signup-error", ""); return; }
+          if (!sb) { setFormError("signup-error", "Connection unavailable. Please try again."); return; }
 
-          account = { name: name, phone: code + " " + digitsOnly(phoneRaw), password: password };
-          setFormError("signup-error", "");
-          openDashboard();
+          var phoneDigits = digitsOnly(code) + digitsOnly(phoneRaw);
+          var email = phoneToEmail(phoneDigits);
+          var btn = e.target.querySelector('button[type="submit"]');
+          btn.disabled = true;
+          try {
+            var res = await sb.auth.signUp({
+              email: email,
+              password: password,
+              options: { data: { full_name: name, phone: phoneDigits } }
+            });
+            if (res.error) { setFormError("signup-error", errText(res.error, "Sign-up failed. Please try again.")); return; }
+            var user = res.data.user;
+            var session = res.data.session;
+            if (!session) {
+              var si = await sb.auth.signInWithPassword({ email: email, password: password });
+              if (si.error) { setFormError("signup-error", errText(si.error, "Account created, but sign-in failed. Please sign in.")); return; }
+              user = si.data.user;
+              session = si.data.session;
+            }
+            if (!user) { setFormError("signup-error", "Sign-up failed. Please try again."); return; }
+            await sb.from("op_profiles").insert({ id: user.id, phone: phoneDigits, full_name: name });
+            await sb.from("op_wallets").insert({ user_id: user.id, balance: 0 });
+            account = { id: user.id, name: name, phone: phoneDigits };
+            setFormError("signup-error", "");
+            await refreshAccountData();
+            openDashboard();
+          } finally {
+            btn.disabled = false;
+          }
         });
 
-        $("login-form").addEventListener("submit", function (e) {
+        $("login-form").addEventListener("submit", async function (e) {
           e.preventDefault();
           var code = $("li-code").value;
           var phoneRaw = $("li-phone").value;
@@ -1310,27 +1461,37 @@
           setFieldError("li-phone-error", !okPhone);
           setFieldError("li-password-error", !okPass);
           if (!okPhone || !okPass) { setFormError("login-error", ""); return; }
+          if (!sb) { setFormError("login-error", "Connection unavailable. Please try again."); return; }
 
-          var phone = code + " " + digitsOnly(phoneRaw);
-          if (account) {
-            if (account.phone !== phone) {
-              setFormError("login-error", "No account found for this phone number. Create an account first.");
-              return;
-            }
-            if (account.password !== password) {
-              setFormError("login-error", "Incorrect password. Please try again.");
-              return;
-            }
-          } else {
-            account = { name: "", phone: phone, password: password };
+          var phoneDigits = digitsOnly(code) + digitsOnly(phoneRaw);
+          var btn = e.target.querySelector('button[type="submit"]');
+          btn.disabled = true;
+          try {
+            var res = await sb.auth.signInWithPassword({ email: phoneToEmail(phoneDigits), password: password });
+            if (res.error) { setFormError("login-error", "Invalid phone number or password. Please try again."); return; }
+            await loadProfile(res.data.user);
+            setFormError("login-error", "");
+            await refreshAccountData();
+            openDashboard();
+          } finally {
+            btn.disabled = false;
           }
-          setFormError("login-error", "");
-          openDashboard();
         });
 
         $("go-login").addEventListener("click", function (e) { e.preventDefault(); showView("view-login"); });
         $("go-signup").addEventListener("click", function (e) { e.preventDefault(); showView("view-signup"); });
-        $("sign-out").addEventListener("click", function () { showView("view-login"); });
+        $("sign-out").addEventListener("click", async function () {
+          if (sb) { try { await sb.auth.signOut(); } catch (err) { /* already signed out */ } }
+          account = null;
+          balance = 0;
+          transactions = [];
+          renderBalance();
+          renderHistory();
+          document.querySelectorAll(".tab-btn").forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-tab") === "home"); });
+          $("tab-panel").hidden = true;
+          $("tab-home").hidden = false;
+          showView("view-login");
+        });
 
         /* ================= Add Money ================= */
         var addPanel = $("add-panel");
@@ -1340,40 +1501,52 @@
           if (open) $("add-amount").focus();
         });
 
-        $("add-confirm").addEventListener("click", function () {
+        $("add-confirm").addEventListener("click", async function () {
           var amt = parseFloat($("add-amount").value);
           if (!amt || amt <= 0) {
             $("add-note").textContent = "Enter an amount greater than zero.";
             $("add-amount").focus();
             return;
           }
-          balance += amt;
-          balanceVisible = true;
-          balToggle.innerHTML = EYE_OPEN;
-          renderBalance();
-          var now = new Date();
-          var senderName = $("add-sender").value.trim().replace(/\s+/g, " ") || "Bank Transfer";
-          var senderBank = $("add-bank").value || "Other Bank";
-          var acct = randomAcct();
-          var rec = {
-            id: "tx-" + genDigits(6),
-            kind: "received",
-            sender: senderName,
-            bank: senderBank,
-            masked: acct.slice(0, 3) + "****" + acct.slice(7),
-            remark: "MOBILE TRANSFER",
-            amount: amt,
-            stamp: now,
-            txNo: genDigits(24),
-            session: genDigits(30)
-          };
-          addTransaction(rec);
-          $("add-note").textContent = "";
-          $("add-amount").value = "";
-          $("add-sender").value = "";
-          $("add-bank").selectedIndex = 0;
-          addPanel.hidden = true;
-          openReceipt(rec, "view-dashboard");
+          if (!account || !sb) { $("add-note").textContent = "Please sign in again to add money."; return; }
+          var btn = $("add-confirm");
+          btn.disabled = true;
+          try {
+            await loadWallet();
+            var now = new Date();
+            var senderName = $("add-sender").value.trim().replace(/\s+/g, " ") || "Bank Transfer";
+            var senderBank = $("add-bank").value || "Other Bank";
+            var acct = randomAcct();
+            var rec = {
+              id: "tx-" + genDigits(6),
+              kind: "received",
+              sender: senderName,
+              bank: senderBank,
+              masked: acct.slice(0, 3) + "****" + acct.slice(7),
+              remark: "MOBILE TRANSFER",
+              amount: amt,
+              stamp: now,
+              txNo: genDigits(24),
+              session: genDigits(30)
+            };
+            var okBal = await writeWallet(balance + amt);
+            if (!okBal) { $("add-note").textContent = "Could not add money. Please try again."; return; }
+            await insertTx(
+              { user_id: account.id, direction: "received", amount: amt, counterparty_name: senderName, counterparty_bank: senderBank, counterparty_masked: rec.masked, remark: "MOBILE TRANSFER", session_id: rec.session, transaction_no: rec.txNo },
+              { user_id: account.id, direction: "received", amount: amt, counterparty_name: senderName, remark: "MOBILE TRANSFER", session_id: rec.session, transaction_no: rec.txNo }
+            );
+            balanceVisible = true;
+            balToggle.innerHTML = EYE_OPEN;
+            await refreshAccountData();
+            $("add-note").textContent = "";
+            $("add-amount").value = "";
+            $("add-sender").value = "";
+            $("add-bank").selectedIndex = 0;
+            addPanel.hidden = true;
+            openReceipt(rec, "view-dashboard");
+          } finally {
+            btn.disabled = false;
+          }
         });
 
         /* ================= Transfer forms ================= */
@@ -1478,35 +1651,63 @@
           showView(pendingTransfer ? pendingTransfer.fromView : "view-dashboard");
         });
         $("cf-cancel").addEventListener("click", function () { showView("view-dashboard"); });
-        $("cf-confirm").addEventListener("click", function () {
-          if (!pendingTransfer) return;
-          if (pendingTransfer.amount > balance) {
-            showToast("Insufficient balance for this transfer.");
-            showView(pendingTransfer.fromView);
-            return;
+        $("cf-confirm").addEventListener("click", async function () {
+          if (!pendingTransfer || transferBusy) return;
+          if (!account || !sb) { showToast("Please sign in again to continue."); return; }
+          var p = pendingTransfer;
+          transferBusy = true;
+          $("cf-confirm").disabled = true;
+          try {
+            await loadWallet();
+            var recipientPhone = normalizePhone(p.kind === "sent-op" ? p.phone : p.acct);
+            var ids = null;
+            var rpcErr = null;
+            var r1 = await sb.rpc("op_transfer", { p_recipient_phone: recipientPhone, p_amount: p.amount });
+            if (!r1.error) {
+              ids = rpcIds(r1.data);
+            } else if (isRecipientNotFound(r1.error)) {
+              var r2 = await sb.rpc("op_to_pp_transfer", { p_recipient_phone: recipientPhone, p_amount: p.amount });
+              if (!r2.error) {
+                ids = rpcIds(r2.data);
+              } else if (isRecipientNotFound(r2.error)) {
+                ids = await externalTransfer(p);
+              } else {
+                rpcErr = r2.error;
+              }
+            } else {
+              rpcErr = r1.error;
+            }
+            if (rpcErr) {
+              if (isInsufficient(rpcErr)) showToast("Insufficient balance for this transfer.");
+              else showToast(errText(rpcErr, "Transfer failed. Please try again."));
+              showView(p.fromView);
+              return;
+            }
+            if (!ids) return; /* externalTransfer already surfaced the problem */
+            var now = new Date();
+            var rec = {
+              id: "tx-" + genDigits(6),
+              kind: p.kind,
+              name: ids.name || p.name,
+              bank: p.bank || null,
+              acct: p.acct || null,
+              phone: p.phone || null,
+              amount: p.amount,
+              stamp: now,
+              txNo: ids.txNo || genDigits(24),
+              session: ids.session || genDigits(30)
+            };
+            if (p.kind === "sent-bank") $("transfer-form").reset();
+            else $("toop-form").reset();
+            pendingTransfer = null;
+            balanceVisible = true;
+            balToggle.innerHTML = EYE_OPEN;
+            await refreshAccountData();
+            openReceipt(rec, "view-dashboard");
+          } finally {
+            transferBusy = false;
+            $("cf-confirm").disabled = false;
           }
-          balance -= pendingTransfer.amount;
-          balanceVisible = true;
-          balToggle.innerHTML = EYE_OPEN;
-          renderBalance();
-          var now = new Date();
-          var rec = {
-            id: "tx-" + genDigits(6),
-            kind: pendingTransfer.kind,
-            name: pendingTransfer.name,
-            bank: pendingTransfer.bank || null,
-            acct: pendingTransfer.acct || null,
-            phone: pendingTransfer.phone || null,
-            amount: pendingTransfer.amount,
-            stamp: now,
-            txNo: genDigits(24),
-            session: genDigits(30)
-          };
-          addTransaction(rec);
-          if (rec.kind === "sent-bank") $("transfer-form").reset();
-          else $("toop-form").reset();
-          pendingTransfer = null;
-          openReceipt(rec, "view-dashboard");
         });
 
         /* ================= Receipts ================= */
@@ -1529,9 +1730,10 @@
           $("rc-t2").textContent = timelineStamp(rec.stamp);
           $("rc-t3").textContent = timelineStamp(new Date(rec.stamp.getTime() + 25000));
           $("rc-recipient-name").textContent = rec.name.toUpperCase();
-          $("rc-recipient-sub").textContent = rec.kind === "sent-bank"
-            ? rec.bank + " | " + rec.acct
-            : "OP | " + rec.phone;
+          $("rc-recipient-sub").textContent =
+            (rec.bank && rec.acct) ? rec.bank + " | " + rec.acct :
+            rec.phone ? "OP | " + rec.phone :
+            rec.acct ? rec.acct : "";
           $("rc-txno").textContent = rec.txNo;
           $("rc-date").textContent = txDateStamp(rec.stamp);
           $("rc-session").textContent = rec.session;
@@ -1539,11 +1741,12 @@
         }
 
         function fillReceivedReceipt(rec) {
-          $("rv-badge").textContent = rec.bank.charAt(0).toUpperCase();
+          $("rv-badge").textContent = (rec.bank || "O").charAt(0).toUpperCase();
           $("rv-title").textContent = "Transfer from " + rec.sender.toUpperCase();
           $("rv-amount").textContent = fmtNaira(rec.amount);
           $("rv-sender-name").textContent = rec.sender.toUpperCase();
-          $("rv-sender-sub").textContent = rec.bank + " | " + rec.masked;
+          $("rv-sender-sub").textContent =
+            (rec.bank && rec.masked) ? rec.bank + " | " + rec.masked : (rec.bank || rec.masked || "");
           $("rv-remark").textContent = rec.remark;
           $("rv-txno").textContent = rec.txNo;
           $("rv-date").textContent = txDateStamp(rec.stamp);
@@ -1575,13 +1778,17 @@
             $("slip-title").textContent = "OP Deposit Receipt";
             $("slip-party-label").textContent = "SENDER";
             $("slip-party").textContent = rec.sender.toUpperCase();
-            $("slip-details").textContent = rec.bank + " | " + rec.masked;
+            $("slip-details").textContent =
+              (rec.bank && rec.masked) ? rec.bank + " | " + rec.masked : (rec.bank || rec.masked || "");
             $("slip-amount").textContent = "+" + fmtNaira(rec.amount);
           } else {
             $("slip-title").textContent = "OP Transfer Receipt";
             $("slip-party-label").textContent = "RECIPIENT";
             $("slip-party").textContent = rec.name.toUpperCase();
-            $("slip-details").textContent = rec.kind === "sent-bank" ? rec.bank + " | " + rec.acct : "OP | " + rec.phone;
+            $("slip-details").textContent =
+              (rec.bank && rec.acct) ? rec.bank + " | " + rec.acct :
+              rec.phone ? "OP | " + rec.phone :
+              rec.acct ? rec.acct : "";
             $("slip-amount").textContent = fmtNaira(rec.amount);
           }
           $("slip-txno").textContent = rec.txNo;
@@ -1612,6 +1819,17 @@
         });
 
         renderHistory();
+
+        /* Restore an existing session straight to the dashboard */
+        if (sb) {
+          sb.auth.getSession().then(async function (res) {
+            var session = res.data && res.data.session;
+            if (!session || !session.user) return;
+            await loadProfile(session.user);
+            await refreshAccountData();
+            openDashboard();
+          }).catch(function () { /* stay on sign-up */ });
+        }
       })();
     </script>
   </body>
