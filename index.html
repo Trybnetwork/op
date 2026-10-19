@@ -1747,7 +1747,10 @@
 
         function bankLogo(bank) {
           if (!bank) return null;
-          var b = String(bank).toLowerCase();
+          var b = String(bank).toLowerCase().trim();
+          /* Exact cross-app codes first: "OP" = OPay, "PP" = PalmPay. */
+          if (b === "op") return BANK_LOGOS.opay;
+          if (b === "pp") return BANK_LOGOS.palmpay;
           if (b.indexOf("wema") !== -1) return BANK_LOGOS.wema;
           if (b.indexOf("palmpay") !== -1) return BANK_LOGOS.palmpay;
           if (b.indexOf("moniepoint") !== -1) return BANK_LOGOS.moniepoint;
