@@ -58,6 +58,29 @@
       .view { display: none; flex: 1; flex-direction: column; }
       .view.active { display: flex; }
 
+      /* ---------- Access gate (lock screen) ---------- */
+      .gate {
+        max-width: 430px;
+        margin: 0 auto;
+        min-height: 100dvh;
+        display: flex;
+        flex-direction: column;
+        background: #ffffff;
+        position: relative;
+      }
+      @media (min-width: 480px) {
+        .gate {
+          border-left: 1px solid var(--line);
+          border-right: 1px solid var(--line);
+          box-shadow: 0 0 40px rgba(17, 24, 39, 0.06);
+        }
+      }
+      /* Locked by default: the app stays hidden until the gate-ok class is set
+         (by the head script for an already-unlocked session, or on Unlock). */
+      html.gate-ok .gate { display: none; }
+      html:not(.gate-ok) .app { display: none; }
+      .btn-primary:disabled { opacity: 0.65; cursor: default; }
+
       /* ---------- Auth screens ---------- */
       .auth { padding: 28px 24px 24px; }
       .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 34px; }
@@ -459,8 +482,45 @@
       }
       .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
     </style>
+    <script>
+      /* Access gate: if this browser session already entered the access code,
+         reveal the app before first paint so there is no flash of the lock
+         screen (or of app content for a still-locked session). */
+      (function () {
+        try {
+          if (sessionStorage.getItem("op-gate-ok") === "1") {
+            document.documentElement.classList.add("gate-ok");
+          }
+        } catch (e) { /* storage unavailable: stay locked */ }
+      })();
+    </script>
   </head>
   <body>
+    <!-- ============ ACCESS GATE (LOCK SCREEN) ============ -->
+    <div class="gate" id="gate">
+      <div class="auth">
+        <div class="brand">
+          <div class="brand-badge">OP</div>
+          <div class="brand-name">OP</div>
+        </div>
+        <h1>Restricted access</h1>
+        <p class="sub">This app is restricted. Enter the access code to continue.</p>
+
+        <div class="error" id="gate-error"></div>
+
+        <form id="gate-form" novalidate>
+          <div class="field">
+            <label for="gate-code">Access code</label>
+            <div class="control">
+              <input id="gate-code" type="password" autocomplete="off" placeholder="Enter the access code" />
+            </div>
+          </div>
+
+          <button type="submit" class="btn-primary" id="gate-unlock">Unlock</button>
+        </form>
+      </div>
+    </div>
+
     <div class="app">
 
       <!-- ============ SIGN UP ============ -->
@@ -1012,8 +1072,12 @@
         /* ================= Supabase ================= */
         var SUPABASE_URL = "https://zvubytosshkxpbpvgcsw.supabase.co";
         var SUPABASE_ANON_KEY = "sb_publishable_c1sl1Mw4Y5EMWjkmYSzEow_m5Yowqk0";
+        /* OP-specific auth storage key: OP and PP share this Supabase project,
+           and the client's default key is derived from the project URL, so both
+           apps would read/write the same stored session and sign each other out.
+           'op-auth-session' keeps OP's session separate from PP's. */
         var sb = (window.supabase && window.supabase.createClient)
-          ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+          ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth: { storageKey: "op-auth-session" } })
           : null;
 
         /* ================= State ================= */
@@ -1093,10 +1157,14 @@
         async function loadProfile(user) {
           var name = (user.user_metadata && user.user_metadata.full_name) || "";
           var phone = (user.user_metadata && user.user_metadata.phone) || "";
+          var profile = null;
           var res = await sb.from("op_profiles").select("full_name, phone").eq("id", user.id).maybeSingle();
-          if (res.data) {
-            if (res.data.full_name) name = res.data.full_name;
-            if (res.data.phone) phone = res.data.phone;
+          if (!res.error && res.data) {
+            profile = res.data;
+          }
+          if (profile) {
+            if (profile.full_name) name = profile.full_name;
+            if (profile.phone) phone = profile.phone;
           }
           account = { id: user.id, name: name, phone: phone };
         }
@@ -1467,7 +1535,7 @@
             if (!user) { setFormError("signup-error", "Sign-up failed. Please try again."); return; }
             await sb.from("op_profiles").insert({ id: user.id, phone: phoneDigits, full_name: name });
             await sb.from("op_wallets").insert({ user_id: user.id, balance: 0 });
-            account = { id: user.id, name: name, phone: phoneDigits };
+            await loadProfile(user);
             setFormError("signup-error", "");
             await refreshAccountData();
             openDashboard();
@@ -1891,8 +1959,10 @@
 
         renderHistory();
 
+        /* ================= Boot + access gate ================= */
         /* Restore an existing session straight to the dashboard */
-        if (sb) {
+        function bootApp() {
+          if (!sb) return;
           sb.auth.getSession().then(async function (res) {
             var session = res.data && res.data.session;
             if (!session || !session.user) return;
@@ -1900,6 +1970,50 @@
             await refreshAccountData();
             openDashboard();
           }).catch(function () { /* stay on sign-up */ });
+        }
+
+        function unlockGate() {
+          try { sessionStorage.setItem("op-gate-ok", "1"); } catch (err) { /* storage unavailable */ }
+          document.documentElement.classList.add("gate-ok");
+          bootApp();
+        }
+
+        var gateAlreadyOk = false;
+        try { gateAlreadyOk = sessionStorage.getItem("op-gate-ok") === "1"; } catch (err) { gateAlreadyOk = false; }
+        if (gateAlreadyOk) {
+          /* Already unlocked this browser session: skip the lock screen */
+          document.documentElement.classList.add("gate-ok");
+          bootApp();
+        } else {
+          /* Locked: the app root stays hidden (CSS) until the code checks out.
+             The code is verified server-side only, via the op_check_access_code
+             RPC — the code itself never appears in this page. */
+          $("gate-form").addEventListener("submit", async function (e) {
+            e.preventDefault();
+            var code = $("gate-code").value;
+            if (!code) { setFormError("gate-error", "Enter the access code."); return; }
+            var btn = $("gate-unlock");
+            btn.disabled = true;
+            btn.textContent = "Checking…";
+            setFormError("gate-error", "");
+            try {
+              if (!sb) throw new Error("Access check unavailable");
+              var res = await sb.rpc("op_check_access_code", { p_code: code });
+              if (res.error) throw res.error;
+              if (res.data === true) {
+                unlockGate();
+              } else {
+                setFormError("gate-error", "Incorrect code.");
+                btn.disabled = false;
+                btn.textContent = "Unlock";
+              }
+            } catch (err) {
+              /* Fail closed: any RPC failure keeps the app locked */
+              setFormError("gate-error", "Access system isn’t set up yet — contact the admin.");
+              btn.disabled = false;
+              btn.textContent = "Unlock";
+            }
+          });
         }
       })();
     </script>
